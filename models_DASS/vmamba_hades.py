@@ -1245,7 +1245,7 @@ class SS2D(nn.Module, mamba_init, SS2Dv0, SS2Dv2, SS2Dv3):
             self.__initv2__(**kwargs)
 
 
-# =====================================================
+
 class VSSBlock(nn.Module):
     def __init__(
         self,
@@ -1386,6 +1386,10 @@ class VSSM(nn.Module):
         patchembed_version: str = "v1", # "v1", "v2"
         use_checkpoint=False,
         # =========================
+        blur_blocks=set([2,3,12]),
+        blur_stage = set([2]),
+        kernel_size = 5,
+        sigma = 1.0,       
         posembed=False,
         imgsize=224,
         **kwargs,
@@ -1431,7 +1435,7 @@ class VSSM(nn.Module):
             v3=self._make_downsample_v3,
             none=(lambda *_, **_k: None),
         ).get(downsample_version, None)
-        self.pool = SimPool(dim = 768)
+
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             downsample = _make_downsample(
@@ -1582,8 +1586,7 @@ class VSSM(nn.Module):
         f = False
         for d in range(depth):
             blur_on = (stage_id == 2) and (d in blur_blocks)
-            if blur_on == True:
-              f = True
+
             blocks.append(VSSBlock(
                 hidden_dim=dim,
                 blur_enable=blur_on,
