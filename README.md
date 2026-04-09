@@ -29,21 +29,42 @@ mkdir -p pretrained_models
 mv /path/to/downloaded/checkpoint.pth ./pretrained_models/
 ```
 
-# Usage (Added Gaussian Convolution hyperparameters in the CLI args)
+# Usage
 
-## For DASS fine-tuning
+## For DASS
 ```
-sh ./scripts/icbhi_dass_train.sh
+python main_v2.py --tag bs16_lr5e-5_ep50_seed2_ce_hades_stage2_blocks2,3 \
+                  --seed 2 \
+                  --dataset icbhi \
+                  --class_split lungsound \
+                  --n_cls 4 \
+                  --epochs 50 \
+                  --batch_size 16 \
+                  --optimizer adam \
+                  --learning_rate 5e-5 \
+                  --weight_decay 1e-6 \
+                  --cosine \
+                  --desired_length 8 \
+                  --model dass \
+                  --test_fold official \
+                  --pad_types repeat \
+                  --resz 1 \
+                  --n_mels 128 \
+                  --ma_update \
+                  --ma_beta 0.5 \
+                  --pretrained \
+                  --from_sl_official \
+                  --audioset_pretrained \
+                  --method ce \
+                  --hades_on \
+                  --hades_stage 2 \
+                  --hades_blocks 2,3 \
+                  --alpha_lb 1.0 \
+                  --alpha_div 1.0
 ```
-
-
-## For Lung-SRAD
-```
-sh ./scripts/icbhi_dual_patchmix_gaussian.sh
-```
-
 
 ## Plot Visualisation
+
 Attention Map and Spectral Filter Response visulisation code is contained in visualize.ipynb (Attention Maps and Spectral filter Response)
 
 
