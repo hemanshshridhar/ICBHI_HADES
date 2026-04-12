@@ -383,7 +383,7 @@ class DASS(nn.Module):
             self.v.load_state_dict(mod_checkpoint, strict=False)
 
     @autocast()
-    def forward(self, x, y=None, patch_mix=False, mix_type="none"):
+    def forward(self, x):
         """
         :param x: input spectrogram (batch_size, time_frame_num, frequency_bins)
         :param y: labels (needed for patch_mix)
@@ -397,16 +397,10 @@ class DASS(nn.Module):
         x = x.unsqueeze(1)
         x = x.transpose(2, 3)
 
-        result = self.v(x=x, y=y, patch_mix=patch_mix, mix_type=mix_type)
+        result = self.v(x)
 
-        if patch_mix:
-            # VSSM patch_mix path returns (features, y_a, y_b, lam, index)
-            features, y_a, y_b, lam, index = result
-            return features, y_a, y_b, lam, index
-        else:
-            # VSSM normal path returns (logits, lb_loss, div_loss)
-            logits, lb_loss, div_loss = result
-            return logits, lb_loss, div_loss
+        logits, lb_loss, div_loss = result
+        return logits, lb_loss, div_loss
 
 
 if __name__ == '__main__':
@@ -420,14 +414,3 @@ if __name__ == '__main__':
     dummy_input = torch.randn(2, 1024, 128)
     dummy_labels = torch.zeros(2, 4)
 
-    # normal forward
-    logits, lb_loss, div_loss = model(dummy_input)
-    print("logits shape:", logits.shape)
-    print("lb_loss:", lb_loss.item())
-    print("div_loss:", div_loss.item())
-
-    # patch_mix forward
-    features, y_a, y_b, lam, index = model(dummy_input, dummy_labels,
-                                            patch_mix=True, mix_type="2d")
-    print("features shape:", features.shape)
-    print("lam:", lam)

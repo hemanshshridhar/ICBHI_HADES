@@ -21,7 +21,6 @@ class ICBHIDataset(Dataset):
         folds_file = os.path.join(args.data_folder, 'patient_list_foldwise.txt')
         official_folds_file = os.path.join(args.data_folder, 'official_split.txt')
         test_fold = args.test_fold
-
         self.data_folder = data_folder
         self.train_flag = train_flag
         self.split = 'train' if train_flag else 'test'
