@@ -402,6 +402,7 @@ class SS2Dv2:
         # ======================
         forward_type="v2",
         channel_first=False,
+        gamma = 0.1,
         # ======================
         **kwargs,    
     ):
@@ -416,7 +417,7 @@ class SS2Dv2:
         self.with_dconv = d_conv > 1
         Linear = Linear2d if channel_first else nn.Linear
         self.forward = self.forwardv2
-
+        self.hades_on = kwargs.get("hades_on", False)
         # tags for forward_type ==============================
         checkpostfix = self.checkpostfix
         self.disable_force32, forward_type = checkpostfix("_no32", forward_type)
@@ -424,7 +425,19 @@ class SS2Dv2:
         self.disable_z, forward_type = checkpostfix("_noz", forward_type)
         self.disable_z_act, forward_type = checkpostfix("_nozact", forward_type)
         self.out_norm, forward_type = self.get_outnorm(forward_type, self.d_inner, channel_first)
-
+        self.gamma          = nn.Parameter(torch.tensor(gamma, dtype=torch.float32))
+        self.total_filters  = self.d_inner
+        self.select_filters = 4 * math.ceil(self.d_inner // 6)
+        self.shared_filters = self.total_filters - self.select_filters
+        self.register_buffer(
+            'shared_ids',
+            torch.arange(self.shared_filters) + self.select_filters
+        )
+        self.h_proj = nn.Linear(
+            self.d_inner + self.d_inner,
+            self.select_filters + self.total_filters // 2,
+            bias=bias
+        )     
         # forward_type debug =======================================
         FORWARD_TYPES = dict(
             v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="mamba", scan_force_torch=True),
@@ -489,7 +502,25 @@ class SS2Dv2:
             self.A_logs = nn.Parameter(torch.zeros((self.k_group * self.d_inner, self.d_state))) # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
             self.dt_projs_weight = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner, self.dt_rank)))
             self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner)))
+            
+    def load_balance_loss(self, x):
+        # x: (B, L, K, select_filters)
+        eps = 1e-10
+        if x.shape[-1] <= 1:                          # guard on filter dim
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        return x.float().var() / (x.float().mean()**2 + eps)
 
+    def diversity_loss(self, outputs):
+        # outputs: (B, K, D, H, W)
+        B, K, D, H, W = outputs.shape
+        outputs = outputs.view(B, K, -1)              # (B, K, D*H*W)
+        outputs = F.normalize(outputs, p=2, dim=-1)   # normalize per direction
+        similarity = torch.bmm(outputs, outputs.transpose(1, 2))  # (B, K, K)
+        eye = torch.eye(K, device=outputs.device).unsqueeze(0)    # (1, K, K)
+        off_diagonal = similarity - eye
+        return (off_diagonal ** 2).mean()
+    
+    
     def forward_corev2(
         self,
         x: torch.Tensor=None, 
@@ -613,7 +644,83 @@ class SS2Dv2:
                 dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
                 if hasattr(self, "dt_projs_weight"):
                     dts = torch.einsum("b k r l, k d r -> b k d l", dts, self.dt_projs_weight)
+            
+            
+            if self.hades_on:
+                xs  = xs.permute(0, 3, 1, 2).contiguous()
+                # (B, L, K, D)
+                if dts.dim() == 3:
+                  dts = dts.view(B, K, D, L)  # (B, K*D, L) → (B, K, D, L)
 
+                dts = dts.permute(0, 3, 1, 2).contiguous()
+                # (B, L, K, D)
+
+                # Spectral residual
+                spectral_residual = xs - torch.cumsum(xs, dim=1) / torch.arange(1, L+1, device=xs.device,dtype=xs.dtype).view(1, -1, 1, 1)
+                # (B, L, K, D)
+
+                # Concatenate for h_proj
+                xsdts = torch.cat([spectral_residual, dts], dim=-1)
+                # (B, L, K, D+D)
+
+                hb = self.h_proj(xsdts)
+                # h_proj: (D+D) → (select_filters + shared_filters)
+                # hb: (B, L, K, select_filters + total_filters//2)
+                
+                
+                
+                h, spectral_bias = torch.split(hb, 
+                    [self.select_filters, self.total_filters//2], dim=-1)
+                # h:              (B, L, K, select_filters)
+                # spectral_bias:  (B, L, K, shared_filters)
+
+                self.lb_loss = self.load_balance_loss(h)
+
+                # Router - select over R dimension
+                _, select_ids = torch.topk(h, self.shared_filters, dim=-1)
+                # select_ids: (B, L, K, shared_filters == 9)
+
+                shared_ids = self.shared_ids.repeat(B, L, K, 1) #-----> equal to  9 here
+                # (B, L, K, shared_filters)
+
+                # Gather from dts_perm along R dimension
+
+
+                dts_expert = torch.gather(dts, dim=3, 
+                            index=select_ids)
+                # (B, L, K, shared_filters == 9)
+
+                dts_shared = torch.gather(dts, dim=3,
+                            index=shared_ids)
+                # (B, L, K, shared_filters)
+
+                # Zero padding for unselected
+                num_zeros = self.total_filters - 2*self.shared_filters 
+                
+                dts_zeros = torch.cat([
+                    torch.zeros(B, L, K, num_zeros // 2, device=dts.device, dtype=dts.dtype),
+                    torch.full((B, L, K, num_zeros // 2), -1000, device=dts.device, dtype=dts.dtype)
+                ], dim=-1)
+
+                # Spectral bias
+                spectral_bias = self.gamma * torch.cat([
+                    spectral_bias,
+                    torch.zeros(B, L, K, self.total_filters//2, 
+                                device=dts.device, dtype=dts.dtype)
+                ], dim=-1)
+
+                # Concatenate
+                dts= torch.cat([
+                    dts_expert,
+                    dts_zeros,
+                    dts_shared
+                ], dim=3)
+                # (B, L, K, R)
+                dts = dts + spectral_bias
+                # Permute back
+                dts = dts.permute(0, 2, 3, 1).contiguous()
+                xs  = xs.permute(0, 2, 3, 1).contiguous()
+                # (B, K, R, L)
             xs = xs.view(B, -1, L)
             dts = dts.contiguous().view(B, -1, L)
             As = -self.A_logs.to(torch.float).exp() # (k * c, d_state)
@@ -639,6 +746,8 @@ class SS2Dv2:
                 ))
 
         y = y.view(B, -1, H, W)
+        if self.hades_on:
+            self.div_loss = self.diversity_loss(ys)
         if not channel_first:
             y = y.view(B, -1, H * W).transpose(dim0=1, dim1=2).contiguous().view(B, H, W, -1) # (B, L, C)
         y = out_norm(y)
@@ -1174,7 +1283,9 @@ class VSSBlock(nn.Module):
         gmlp=False,
         # =============================
         use_checkpoint: bool = False,
+  
         post_norm: bool = False,
+        hades_on =False,
         # =============================
         _SS2D: type = SS2D,
         **kwargs,
@@ -1205,6 +1316,7 @@ class VSSBlock(nn.Module):
                 # dt_init="random",
                 # dt_scale="random",
                 # dt_init_floor=1e-4,
+                hades_on=hades_on,            
                 initialize=ssm_init,
                 # ==========================
                 forward_type=forward_type,
@@ -1239,7 +1351,28 @@ class VSSBlock(nn.Module):
         else:
             return self._forward(input)
 
+class hades_layer(nn.Module):
+    def __init__(self, blocks, downsample, blur_block_ids=None):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+        self.downsample = downsample
+        if isinstance(blur_block_ids, int):
+            blur_block_ids = {blur_block_ids}
+        self.blur_block_ids = set(blur_block_ids) if blur_block_ids else set()
 
+    def forward(self, x):
+        lb_loss  = torch.tensor(0.0, device=x.device)
+        div_loss = torch.tensor(0.0, device=x.device)
+
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            if i in self.blur_block_ids:
+                lb_loss  = lb_loss  + block.op.lb_loss
+                div_loss = div_loss + block.op.div_loss
+
+        x = self.downsample(x)
+        return x, lb_loss, div_loss
+    
 class VSSM(nn.Module):
     def __init__(
         self, 
@@ -1271,6 +1404,9 @@ class VSSM(nn.Module):
         patchembed_version: str = "v1", # "v1", "v2"
         use_checkpoint=False,  
         # =========================
+        hades_blocks=None,
+        hades_stage = None,
+
         posembed=False,
         imgsize=224,
         _SS2D=SS2D,
@@ -1278,6 +1414,8 @@ class VSSM(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        hades_blocks = set([2, 3, 12]) if hades_blocks is None else set(hades_blocks)
+        hades_stage  = set([2])        if hades_stage  is None else set(hades_stage)
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -1330,6 +1468,7 @@ class VSSM(nn.Module):
 
             self.layers.append(self._make_layer(
                 dim = self.dims[i_layer],
+                stage_id = i_layer,
                 drop_path = dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 use_checkpoint=use_checkpoint,
                 norm_layer=norm_layer,
@@ -1350,6 +1489,8 @@ class VSSM(nn.Module):
                 mlp_act_layer=mlp_act_layer,
                 mlp_drop_rate=mlp_drop_rate,
                 gmlp=gmlp,
+                hades_stage = hades_stage,
+                hades_blocks = hades_blocks,
                 # =================
                 _SS2D=_SS2D,
             ))
@@ -1445,6 +1586,7 @@ class VSSM(nn.Module):
         downsample=nn.Identity(),
         channel_first=False,
         # ===========================
+        stage_id = 0,
         ssm_d_state=16,
         ssm_ratio=2.0,
         ssm_dt_rank="auto",       
@@ -1459,14 +1601,24 @@ class VSSM(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate=0.0,
         gmlp=False,
+        hades_blocks= None,
+        hades_stage = None,
         # ===========================
         _SS2D=SS2D,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
+        hades_blocks = set(hades_blocks) if hades_blocks is not None else set()
+        hades_stage  = set(hades_stage)  if hades_stage  is not None else set()
         depth = len(drop_path)
         blocks = []
         for d in range(depth):
+            hades_on = (stage_id in hades_stage) and (d in hades_blocks)
+            hades_kwargs = {}
+            if hades_on:
+                hades_kwargs.update(
+                    hades_on = True
+                )
             blocks.append(VSSBlock(
                 hidden_dim=dim, 
                 drop_path=drop_path[d],
@@ -1487,8 +1639,15 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 use_checkpoint=use_checkpoint,
                 _SS2D=_SS2D,
+                **hades_kwargs,
             ))
-        
+        if stage_id in hades_stage:
+            valid_block_ids = {b for b in hades_blocks if b < depth} 
+            return hades_layer(
+                blocks=blocks,
+                downsample=downsample,
+                blur_block_ids=valid_block_ids  # full set, not just first
+            )
         return nn.Sequential(OrderedDict(
             blocks=nn.Sequential(*blocks,),
             downsample=downsample,
@@ -1499,10 +1658,20 @@ class VSSM(nn.Module):
         if self.pos_embed is not None:
             pos_embed = self.pos_embed.permute(0, 2, 3, 1) if not self.channel_first else self.pos_embed
             x = x + pos_embed
+
+        total_lb_loss  = torch.tensor(0.0, device=x.device)
+        total_div_loss = torch.tensor(0.0, device=x.device)
+
         for layer in self.layers:
-            x = layer(x)
+            if isinstance(layer, hades_layer):
+                x, lb, div = layer(x)
+                total_lb_loss  = total_lb_loss  + lb
+                total_div_loss = total_div_loss + div
+            else:
+                x = layer(x)
+
         x = self.classifier(x)
-        return x
+        return x, total_lb_loss, total_div_loss
 
     def flops(self, shape=(3, 224, 224), verbose=True):
         # shape = self.__input_shape__[1:]
