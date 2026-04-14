@@ -20,20 +20,16 @@ DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 # torch.backends.cudnn.deterministic = True
 
 try:
-    from .csm_triton import cross_scan_fn, cross_merge_fn
+    from models_DASS.csm_triton import cross_scan_fn, cross_merge_fn
 except:
     from csm_triton import cross_scan_fn, cross_merge_fn
 
 try:
-    from .csms6s import selective_scan_fn, selective_scan_flop_jit
+    from models_DASS.csms6s import selective_scan_fn, selective_scan_flop_jit
 except:
     from csms6s import selective_scan_fn, selective_scan_flop_jit
 
-# FLOPs counter not prepared fro mamba2
-try:
-    from .mamba2.ssd_minimal import selective_scan_chunk_fn
-except:
-    from mamba2.ssd_minimal import selective_scan_chunk_fn
+
 
 
 # =====================================================
@@ -504,22 +500,53 @@ class SS2Dv2:
             self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner)))
             
     def load_balance_loss(self, x):
-        # x: (B, L, K, select_filters)
-        eps = 1e-10
-        if x.shape[-1] <= 1:                          # guard on filter dim
-            return torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        return x.float().var() / (x.float().mean()**2 + eps)
+        eps = 1e-6                          # larger eps for stability
+        x = x.float()
+        x = torch.abs(x)                    # make positive first
+        mean = x.mean().clamp(min=eps)      # clamp mean directly
+        var  = x.var()
+        return (var / (mean**2 + eps)).clamp(max=100.0)  # clamp explosion
 
+    # def diversity_loss(self, outputs):
+    #     if outputs.dim() == 5:
+    #         B, K, D, H, W = outputs.shape
+    #     elif outputs.dim() == 4:
+    #         B, K, D, L = outputs.shape
+    #         H, W = 1, L
+    #     else:
+    #         return torch.tensor(0.0, device=outputs.device)
+        
+    #     outputs = outputs.reshape(B, K, -1).float()
+    #     norm = outputs.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+    #     outputs = outputs / norm                          # safe normalize
+    #     similarity = torch.bmm(outputs, outputs.transpose(1, 2))
+    #     eye = torch.eye(K, device=outputs.device).unsqueeze(0)
+    #     off_diagonal = similarity - eye
+    #     return (off_diagonal ** 2).mean().clamp(max=10.0)  # clamp explosion\
     def diversity_loss(self, outputs):
-        # outputs: (B, K, D, H, W)
-        B, K, D, H, W = outputs.shape
-        outputs = outputs.view(B, K, -1)              # (B, K, D*H*W)
-        outputs = F.normalize(outputs, p=2, dim=-1)   # normalize per direction
-        similarity = torch.bmm(outputs, outputs.transpose(1, 2))  # (B, K, K)
-        eye = torch.eye(K, device=outputs.device).unsqueeze(0)    # (1, K, K)
-        off_diagonal = similarity - eye
-        return (off_diagonal ** 2).mean()
-    
+      # outputs: (B, K, D, H, W)
+      B, K, D, H, W = outputs.shape
+      
+      # reshape to (B*K, D, H*W) — diversity across D filters
+      outputs = outputs.view(B * K, D, H * W).float()
+      outputs = F.normalize(outputs, p=2, dim=-1)  # (B*K, D, H*W)
+      
+      # pairwise similarity across D filters
+      # but D can be large (192) → expensive
+      # sample subset of filters for efficiency
+      num_sample = min(D, 32)   # sample 32 filters
+      idx = torch.randperm(D, device=outputs.device)[:num_sample]
+      outputs_sampled = outputs[:, idx, :]   # (B*K, 32, H*W)
+      
+      similarity = torch.bmm(
+          outputs_sampled, 
+          outputs_sampled.transpose(1, 2)
+      )   # (B*K, 32, 32)
+      
+      eye = torch.eye(num_sample, device=outputs.device).unsqueeze(0)
+      off_diagonal = similarity - eye
+      return (off_diagonal ** 2).mean().clamp(max=10.0)  
+
     
     def forward_corev2(
         self,
@@ -708,15 +735,27 @@ class SS2Dv2:
                     torch.zeros(B, L, K, self.total_filters//2, 
                                 device=dts.device, dtype=dts.dtype)
                 ], dim=-1)
-
-                # Concatenate
+                spectral_bias_expert = self.gamma * spectral_bias 
+                pad_size = self.shared_filters - self.total_filters // 2
+                if pad_size > 0:
+                    spectral_bias_expert = torch.cat([
+                        spectral_bias_expert,
+                        torch.zeros(B, L, K, pad_size, device=dts.device, dtype=dts.dtype)
+                    ], dim=-1)
+                else:
+                    spectral_bias_expert = spectral_bias_expert[:, :, :, :self.shared_filters]
+                spectral_bias_full = torch.cat([
+                    spectral_bias_expert,                                          # expert: biased
+                    torch.zeros(B, L, K, num_zeros, device=dts.device, dtype=dts.dtype),  # zeros: no bias
+                    torch.zeros(B, L, K, self.shared_filters, device=dts.device, dtype=dts.dtype)  # shared: NO bias
+                ], dim=-1)
                 dts= torch.cat([
                     dts_expert,
                     dts_zeros,
                     dts_shared
                 ], dim=3)
                 # (B, L, K, R)
-                dts = dts + spectral_bias
+                dts = dts + spectral_bias_full
                 # Permute back
                 dts = dts.permute(0, 2, 3, 1).contiguous()
                 xs  = xs.permute(0, 2, 3, 1).contiguous()
