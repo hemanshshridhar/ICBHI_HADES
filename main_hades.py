@@ -25,7 +25,7 @@ from util.misc import adjust_learning_rate, warmup_learning_rate, set_optimizer,
 from util.misc import AverageMeter, accuracy, save_model, update_json
 from models import get_backbone_class
 
-from models_DASS.ast_models import DASS
+from models_DASS.ast_models_vs import DASS
 
 
 def parse_args():
