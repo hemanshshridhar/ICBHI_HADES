@@ -11,8 +11,8 @@ conda install -c conda-forge ffmpeg=6
 ```
 
 ```bash
-git clone https://github.com/Saurabhbhati/DASS.git
-cd DASS/kernels/selective_scan && pip install --no-build-isolation .
+git clone https://github.com/MzeroMiko/VMamba.git
+cd VMamba/kernels/selective_scan && pip install .
 ```
 # Pre-trained Weights
 
@@ -62,6 +62,12 @@ python main_v2.py --tag bs16_lr5e-5_ep50_seed2_ce_hades_stage2_blocks2,3 \
                   --alpha_lb 1.0 \
                   --alpha_div 1.0
 ```
+
+## References
+
+The idea and code for this implementation is heavily inspired by the ICLR 2026 Paper "Graph Signal Processing Meets Mamba2: Adaptive Filter Bank via Delta Modulation"  (https://arxiv.org/abs/1234.12345) in which the Mixture fo experts is applied to "dts" parameter. 
+
+
 
 ## Plot Visualisation
 
